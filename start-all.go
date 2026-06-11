@@ -80,6 +80,7 @@ func main() {
 
 	backendExe := filepath.Join(root, "bin", exeName("qwen2api-backend"))
 	must(os.MkdirAll(filepath.Dir(backendExe), 0o755))
+	canonicalBackendExe := backendExe
 
 	fmt.Println("qwen2API launcher")
 	fmt.Println("root:     ", root)
@@ -89,12 +90,10 @@ func main() {
 	fmt.Println("frontend: ", fmt.Sprintf("http://127.0.0.1:%d", *frontendPort))
 	fmt.Println()
 
-	runForeground(commandSpec{
-		name: "build-backend",
-		dir:  backendDir,
-		exe:  goExe,
-		args: []string{"build", "-o", backendExe, "."},
-	})
+	backendExe = buildBackend(goExe, backendDir, canonicalBackendExe)
+	if backendExe != canonicalBackendExe {
+		defer os.Remove(backendExe)
+	}
 
 	if *installBrowsers {
 		runForeground(commandSpec{
@@ -268,16 +267,59 @@ func enablePrewarmAfterStart(port int, adminKey string, target int) error {
 	return nil
 }
 
+func buildBackend(goExe, backendDir, canonicalExe string) string {
+	spec := commandSpec{
+		name: "build-backend",
+		dir:  backendDir,
+		exe:  goExe,
+		args: []string{"build", "-o", canonicalExe, "."},
+	}
+	output, err := runForegroundOutput(spec)
+	if err == nil {
+		return canonicalExe
+	}
+	if !looksLikeLockedExecutable(output) {
+		fatalf("%s failed: %v", spec.name, err)
+	}
+
+	fallbackExe := launcherBackendExe(canonicalExe)
+	must(os.MkdirAll(filepath.Dir(fallbackExe), 0o755))
+	fmt.Printf("[launcher] backend executable is in use; building isolated launcher copy: %s\n", fallbackExe)
+	spec.args = []string{"build", "-o", fallbackExe, "."}
+	if _, err := runForegroundOutput(spec); err != nil {
+		fatalf("%s fallback failed: %v", spec.name, err)
+	}
+	return fallbackExe
+}
+
+func launcherBackendExe(canonicalExe string) string {
+	name := fmt.Sprintf("qwen2api-backend-launcher-%d", os.Getpid())
+	return filepath.Join(filepath.Dir(canonicalExe), ".launcher", exeName(name))
+}
+
+func looksLikeLockedExecutable(output string) bool {
+	lowered := strings.ToLower(output)
+	return strings.Contains(lowered, "being used by another process") ||
+		strings.Contains(lowered, "cannot access the file because it is being used") ||
+		strings.Contains(lowered, "text file busy")
+}
+
 func runForeground(spec commandSpec) {
+	if _, err := runForegroundOutput(spec); err != nil {
+		fatalf("%s failed: %v", spec.name, err)
+	}
+}
+
+func runForegroundOutput(spec commandSpec) (string, error) {
 	fmt.Println("[launcher] running", spec.name)
 	cmd := exec.Command(spec.exe, spec.args...)
 	cmd.Dir = spec.dir
 	cmd.Env = mergedEnv(spec.env)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fatalf("%s failed: %v", spec.name, err)
-	}
+	var output bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &output)
+	err := cmd.Run()
+	return output.String(), err
 }
 
 func startBackground(ctx context.Context, spec commandSpec) *exec.Cmd {

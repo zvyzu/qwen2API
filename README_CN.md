@@ -188,6 +188,7 @@ flowchart LR
 | `QWEN_API_KEY`、`QWEN_API_KEYS`、`QWEN_API_KEY_N` | 环境变量注入的下游 API Key，仅运行时存在，不写入 `data/api_keys.json`，不能从 WebUI 删除 |
 | `QWEN_ACCOUNT_N` | 环境变量注入的上游账号，格式为 `token;optional-email;optional-password`，不写入 `data/accounts.json` |
 | `KEEPALIVE_URL`、`KEEPALIVE_INTERVAL` | 可选后台保活任务；环境变量存在时会锁定 WebUI 中对应配置 |
+| `TOOL_RECOVERY_MAX_ATTEMPTS` | 工具结果之后上游没有产出下一次客户端工具调用时的自动恢复尝试次数；默认 `4`，限制在 `1`-`8` |
 | `HOST_DATA_DIR`、`HOST_LOGS_DIR` | Docker 宿主机挂载路径，默认 `./data` 和 `./logs` |
 | `DATA_DIR`、`LOGS_DIR` | 本地非 Docker 路径覆盖；留空时使用当前项目目录 |
 

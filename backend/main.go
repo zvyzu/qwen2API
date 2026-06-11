@@ -1777,6 +1777,7 @@ type Settings struct {
 	UpstreamStreamFirstEventTimeoutSeconds int
 	UpstreamStreamIdleTimeoutSeconds       int
 	MaxRetries                             int
+	ToolRecoveryMaxAttempts                int
 	RateLimitCooldown                      int
 	AccountMinIntervalMS                   int
 	RequestJitterMinMS                     int
@@ -1837,6 +1838,7 @@ func LoadSettings() Settings {
 		UpstreamStreamFirstEventTimeoutSeconds: envInt("UPSTREAM_STREAM_FIRST_EVENT_TIMEOUT_SECONDS", 180),
 		UpstreamStreamIdleTimeoutSeconds:       envInt("UPSTREAM_STREAM_IDLE_TIMEOUT_SECONDS", 180),
 		MaxRetries:                             envInt("MAX_RETRIES", 3),
+		ToolRecoveryMaxAttempts:                clampInt(envInt("TOOL_RECOVERY_MAX_ATTEMPTS", 4), 1, 8),
 		RateLimitCooldown:                      600,
 		AccountMinIntervalMS:                   envInt("ACCOUNT_MIN_INTERVAL_MS", 0),
 		RequestJitterMinMS:                     envInt("REQUEST_JITTER_MIN_MS", 0),
@@ -2561,6 +2563,56 @@ func (app *App) runCompletion(ctx context.Context, req StandardRequest, preferre
 	return app.runCompletionWithHooks(ctx, req, preferredEmail, nil)
 }
 
+func (app *App) acquireCompletionChat(ctx context.Context, req StandardRequest, preferredEmail string) (*Account, string, bool, error) {
+	attempts := 1
+	if req.BoundAccount == nil {
+		attempts = maxInt(1, app.settings.MaxRetries)
+		if app.accounts != nil {
+			attempts = maxInt(attempts, len(app.accounts.Snapshot()))
+		}
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var (
+			acc *Account
+			err error
+		)
+		if req.BoundAccount != nil {
+			acc = req.BoundAccount
+		} else {
+			acc, err = app.accounts.Acquire(ctx, preferredEmail)
+			if err != nil {
+				app.logWarn(ctx, "获取账号失败", "attempt", attempt, "max_attempts", attempts, "error", err)
+				if lastErr != nil {
+					return nil, "", false, lastErr
+				}
+				return nil, "", false, err
+			}
+		}
+		setRequestLogFields(ctx, "account", acc.Email)
+		app.logInfo(ctx, "获取账号", "preferred_email", firstNonEmpty(preferredEmail, "-"), "attempt", attempt, "max_attempts", attempts)
+
+		app.chatPool.RememberModel(req.ResolvedModel, req.ChatType)
+		chatID, reused := app.chatPool.Take(ctx, acc.Email, req.ResolvedModel, req.ChatType)
+		if reused {
+			return acc, chatID, true, nil
+		}
+		chatID, err = app.client.CreateChat(ctx, acc.Token, req.ResolvedModel, req.ChatType)
+		if err == nil {
+			return acc, chatID, false, nil
+		}
+		lastErr = err
+		app.classifyAccountError(acc, err)
+		app.logWarn(ctx, "创建上游会话失败", "account", acc.Email, "attempt", attempt, "max_attempts", attempts, "error", err)
+		if req.BoundAccount != nil || !isRetryableCreateChatError(err) || attempt == attempts {
+			app.accounts.Release(acc)
+			return nil, "", false, err
+		}
+		app.accounts.Release(acc)
+	}
+	return nil, "", false, lastErr
+}
+
 func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest, preferredEmail string, hooks *completionStreamHooks) (CompletionResult, error) {
 	if req.BoundAccount != nil {
 		preferredEmail = req.BoundAccount.Email
@@ -2568,38 +2620,11 @@ func (app *App) runCompletionWithHooks(ctx context.Context, req StandardRequest,
 	if preferredEmail == "" {
 		preferredEmail = req.PreferredEmail
 	}
-	var (
-		acc            *Account
-		err            error
-		releaseAccount bool
-	)
-	if req.BoundAccount != nil {
-		acc = req.BoundAccount
-		releaseAccount = true
-	} else {
-		acc, err = app.accounts.Acquire(ctx, preferredEmail)
-		if err != nil {
-			app.logWarn(ctx, "获取账号失败", "error", err)
-			return CompletionResult{}, err
-		}
-		releaseAccount = true
+	acc, chatID, reused, err := app.acquireCompletionChat(ctx, req, preferredEmail)
+	if err != nil {
+		return CompletionResult{}, err
 	}
-	if releaseAccount {
-		defer app.accounts.Release(acc)
-	}
-	setRequestLogFields(ctx, "account", acc.Email)
-	app.logInfo(ctx, "获取账号", "preferred_email", firstNonEmpty(preferredEmail, "-"))
-
-	app.chatPool.RememberModel(req.ResolvedModel, req.ChatType)
-	chatID, reused := app.chatPool.Take(ctx, acc.Email, req.ResolvedModel, req.ChatType)
-	if !reused {
-		chatID, err = app.client.CreateChat(ctx, acc.Token, req.ResolvedModel, req.ChatType)
-		if err != nil {
-			app.classifyAccountError(acc, err)
-			app.logWarn(ctx, "创建上游会话失败", "account", acc.Email, "error", err)
-			return CompletionResult{}, err
-		}
-	}
+	defer app.accounts.Release(acc)
 	defer asyncDeleteChat(app.client, acc.Token, chatID)
 	setRequestLogFields(ctx, "chat_id", chatID)
 	app.logInfo(ctx, "创建上游会话", "chat_type", req.ChatType, "prewarmed", reused)
@@ -3871,20 +3896,21 @@ func (app *App) recoverMissingToolContinuation(ctx context.Context, acc *Account
 	}
 	working := result
 	bestText := CompletionResult{}
-	for attempt := 1; attempt <= 2; attempt++ {
+	maxAttempts := app.toolRecoveryMaxAttempts()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		retryPrompt := injectMissingToolContinuationGuard(req.Prompt, toolParseText(working))
-		app.logInfo(ctx, "[Retry] missing tool continuation", "attempt", attempt, "answer_len", len(working.AnswerText), "reasoning_len", len(working.ReasoningText))
+		app.logInfo(ctx, "[Retry] missing tool continuation", "attempt", attempt, "max_attempts", maxAttempts, "answer_len", len(working.AnswerText), "reasoning_len", len(working.ReasoningText))
 		retryResult, err := app.runToolMarkupRecoveryAttempt(ctx, acc, req, retryPrompt, "missing_tool_continuation_retry")
 		if err != nil {
-			app.logWarn(ctx, "[Retry] missing tool continuation retry failed", "attempt", attempt, "error", err)
+			app.logWarn(ctx, "[Retry] missing tool continuation retry failed", "attempt", attempt, "max_attempts", maxAttempts, "error", err)
 			continue
 		}
 		if len(retryResult.ToolCalls) > 0 {
-			app.logInfo(ctx, "[Retry] missing tool continuation produced tool calls", "attempt", attempt, "tools", parsedToolNames(retryResult.ToolCalls))
+			app.logInfo(ctx, "[Retry] missing tool continuation produced tool calls", "attempt", attempt, "max_attempts", maxAttempts, "tools", parsedToolNames(retryResult.ToolCalls))
 			return retryResult
 		}
 		if isInvalidToolArgsResult(retryResult) {
-			app.logWarn(ctx, "[Retry] missing tool continuation produced invalid tool arguments", "attempt", attempt, "tool", invalidToolArgsName(retryResult))
+			app.logWarn(ctx, "[Retry] missing tool continuation produced invalid tool arguments", "attempt", attempt, "max_attempts", maxAttempts, "tool", invalidToolArgsName(retryResult))
 			fixed := app.recoverInvalidToolCallArgs(ctx, acc, req, retryResult)
 			if len(fixed.ToolCalls) > 0 {
 				return fixed
@@ -3901,6 +3927,13 @@ func (app *App) recoverMissingToolContinuation(ctx context.Context, acc *Account
 		return bestText
 	}
 	return result
+}
+
+func (app *App) toolRecoveryMaxAttempts() int {
+	if app == nil {
+		return 4
+	}
+	return clampInt(app.settings.ToolRecoveryMaxAttempts, 1, 8)
 }
 
 func (app *App) recoverMissingInitialToolCall(ctx context.Context, acc *Account, req StandardRequest, result CompletionResult) CompletionResult {
@@ -4194,14 +4227,16 @@ func injectMissingToolContinuationGuard(prompt, answerText string) string {
 	if strings.TrimSpace(tail) == "" {
 		tail = "(empty)"
 	}
-	guard := "[MANDATORY]: The previous assistant turn came immediately after a client tool result but it only produced narration/plan text and did not execute the next action.\n" +
-		"Do NOT repeat the round label, status summary, or plan. Continue from the latest tool result.\n" +
-		"If the task is not fully complete, your next assistant turn MUST be exactly one fresh, complete QNML tool call and nothing else.\n" +
-		"If the original task requires final checks or verification, do not claim completion unless the latest tool evidence proves those checks passed; otherwise issue a verification tool call or state the unverifiable result honestly.\n" +
-		"For QNML use exactly this shell: <|QNML|tool_calls> then <|QNML|invoke name=\"TOOL_NAME\"> then <|QNML|parameter name=\"ARG\"><![CDATA[value]]></|QNML|parameter> then close invoke and tool_calls.\n" +
+	orderedGuidance := missingToolContinuationOrderedGuidance(prompt)
+	guard := "[RECOVERY]: The previous assistant turn came immediately after a client tool result but did not include a parseable next client tool call.\n" +
+		"Continue from the latest tool result and original user goal; do not restart the task.\n" +
+		orderedGuidance +
+		"If another client-side action is needed, return a fresh, complete QNML tool call using the available action names and required parameters.\n" +
+		"If the task is already complete from the available tool evidence, answer normally instead of forcing another tool call.\n" +
+		"If final checks or verification are required but not yet evidenced, prefer a verification tool call or state the limitation honestly.\n" +
+		"QNML shape: <|QNML|tool_calls><|QNML|invoke name=\"TOOL_NAME\"><|QNML|parameter name=\"ARG\"><![CDATA[value]]></|QNML|parameter></|QNML|invoke></|QNML|tool_calls>.\n" +
 		toolArgumentRetryInstruction() +
-		"Only if the task is truly complete may you return the final completion answer instead of a tool call.\n" +
-		"Previous narration to avoid repeating:\n```\n" + tail + "\n```"
+		"Previous non-tool output for context only:\n```\n" + tail + "\n```"
 	trimmed := strings.TrimRight(prompt, " \t\r\n")
 	if strings.HasSuffix(trimmed, "Assistant:") {
 		return strings.TrimRight(trimmed[:len(trimmed)-len("Assistant:")], " \t\r\n") + "\n\n" + guard + "\n\nAssistant:"
@@ -4209,17 +4244,30 @@ func injectMissingToolContinuationGuard(prompt, answerText string) string {
 	return trimmed + "\n\n" + guard + "\n\nAssistant:"
 }
 
+func missingToolContinuationOrderedGuidance(prompt string) string {
+	next := nextUnmetPlannedRound(prompt)
+	if next <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"ORDERED WORKFLOW HINT: The earliest planned round without an observed JSON progress record appears to be R%03d. If this ordered workflow still applies, continue at R%03d using the original per-round instruction/template instead of repeating completed rounds or jumping ahead past R%03d.\n",
+		next,
+		next,
+		next,
+	)
+}
+
 func injectMissingInitialToolCallGuard(prompt, answerText string) string {
 	tail := promptTail(answerText, 500)
 	if strings.TrimSpace(tail) == "" {
 		tail = "(empty)"
 	}
-	guard := "[MANDATORY]: The previous assistant turn answered an executable user task with narration, a plan, or an unverified completion claim but did not emit any client-side tool call.\n" +
-		"Do NOT repeat the plan or say you will start. If the user's task requires file access, shell execution, search, browser work, skills, agents, or artifact verification, your next assistant turn MUST be exactly one fresh, complete QNML tool call and nothing else.\n" +
-		"If no client-side action is actually required, answer normally and explain that no tool execution is needed. If the task cannot be executed, state that limitation honestly instead of claiming completion.\n" +
-		"For QNML use exactly this shell: <|QNML|tool_calls> then <|QNML|invoke name=\"TOOL_NAME\"> then <|QNML|parameter name=\"ARG\"><![CDATA[value]]></|QNML|parameter> then close invoke and tool_calls.\n" +
+	guard := "[RECOVERY]: The previous assistant turn did not include a parseable client-side tool call for a task that appears executable.\n" +
+		"Review the user's actual goal and the available action names. If a client-side action is needed, choose the suitable tool and return a complete QNML tool call with required parameters.\n" +
+		"If no client-side action is needed, or the task cannot be performed with the available tools, answer normally and state that clearly.\n" +
+		"QNML shape: <|QNML|tool_calls><|QNML|invoke name=\"TOOL_NAME\"><|QNML|parameter name=\"ARG\"><![CDATA[value]]></|QNML|parameter></|QNML|invoke></|QNML|tool_calls>.\n" +
 		toolArgumentRetryInstruction() +
-		"Previous narration to avoid repeating:\n```\n" + tail + "\n```"
+		"Previous non-tool output for context only:\n```\n" + tail + "\n```"
 	trimmed := strings.TrimRight(prompt, " \t\r\n")
 	if strings.HasSuffix(trimmed, "Assistant:") {
 		return strings.TrimRight(trimmed[:len(trimmed)-len("Assistant:")], " \t\r\n") + "\n\n" + guard + "\n\nAssistant:"
@@ -4339,6 +4387,15 @@ func (app *App) classifyAccountErrorFor(acc *Account, err error, usage string) {
 		}
 		return
 	}
+	if isTransientUpstreamErrorMessage(lower) {
+		usage = normalizeAccountUsage(usage)
+		cooldown := transientUpstreamCooldownSeconds(app.settings)
+		app.accounts.MarkRateLimitedFor(acc, usage, cooldown, msg)
+		if app.logger != nil {
+			app.logger.Warn("账号进入临时上游异常冷却", "account", acc.Email, "usage", usage, "cooldown_seconds", cooldown, "error", truncate(msg, 240))
+		}
+		return
+	}
 	if isAuthErrorMessage(lower) {
 		app.accounts.MarkInvalid(acc, "auth_error", msg)
 		if app.logger != nil {
@@ -4432,6 +4489,136 @@ func isAuthErrorMessage(lower string) bool {
 		}
 	}
 	return false
+}
+
+func isRetryableCreateChatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if isModelNotFoundErrorMessage(msg) {
+		return false
+	}
+	if isRateLimitErrorMessage(msg) || isTransientUpstreamErrorMessage(msg) {
+		return true
+	}
+	return false
+}
+
+func isTransientUpstreamErrorMessage(lower string) bool {
+	lower = strings.ToLower(lower)
+	if strings.TrimSpace(lower) == "" {
+		return false
+	}
+	if strings.Contains(lower, "http 500") ||
+		strings.Contains(lower, "http 502") ||
+		strings.Contains(lower, "http 503") ||
+		strings.Contains(lower, "http 504") ||
+		strings.Contains(lower, "status 500") ||
+		strings.Contains(lower, "status 502") ||
+		strings.Contains(lower, "status 503") ||
+		strings.Contains(lower, "status 504") ||
+		strings.Contains(lower, "status=500") ||
+		strings.Contains(lower, "status=502") ||
+		strings.Contains(lower, "status=503") ||
+		strings.Contains(lower, "status=504") {
+		return true
+	}
+	for _, marker := range []string{
+		"create_chat parse error",
+		"invalid character '<'",
+		"<!doctype",
+		"<html",
+		"aliyun_waf",
+		"waf",
+		"captcha",
+		"security check",
+		"please enable javascript",
+		"context deadline exceeded",
+		"i/o timeout",
+		"net/http: request canceled",
+		"timeout",
+		"timed out",
+		"wsarecv",
+		"connection attempt failed",
+		"connected party did not properly respond",
+		"connected host has failed to respond",
+		"failed to respond",
+		"connection reset",
+		"connection refused",
+		"connection aborted",
+		"connection closed",
+		"connection timed out",
+		"server closed idle connection",
+		"unexpected eof",
+		"temporary failure",
+		"temporarily unavailable",
+		"bad gateway",
+		"gateway timeout",
+		"service unavailable",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+const upstreamTemporaryClientMessage = "上游 Qwen 请求被网络超时、连接中断或 WAF 风控拦截；网关已按当前策略重试/切换账号但仍失败。请稍后重试，或在管理页刷新/复验账号后再试。"
+
+func sanitizeClientErrorDetail(detail any) any {
+	switch v := detail.(type) {
+	case string:
+		return sanitizeClientErrorString(v)
+	case error:
+		return sanitizeClientErrorString(v.Error())
+	default:
+		return detail
+	}
+}
+
+func sanitizeClientErrorString(msg string) string {
+	if shouldMaskUpstreamErrorMessage(msg) {
+		return upstreamTemporaryClientMessage
+	}
+	return msg
+}
+
+func shouldMaskUpstreamErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	if strings.TrimSpace(lower) == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"chat.qwen.ai",
+		"create_chat",
+		"stream_chat",
+		"upstream",
+		"qwen api",
+		"aliyun_waf",
+		"<!doctype",
+		"<html",
+		"captcha",
+		"wsarecv",
+		"connection attempt failed",
+		"connected party did not properly respond",
+		"connected host has failed to respond",
+		"net/http: request canceled",
+		"context deadline exceeded",
+		"i/o timeout",
+	} {
+		if strings.Contains(lower, marker) && isTransientUpstreamErrorMessage(lower) {
+			return true
+		}
+	}
+	return false
+}
+
+func transientUpstreamCooldownSeconds(settings Settings) int {
+	return clampInt(settings.RateLimitBaseCooldown/20, 10, 30)
 }
 
 func (app *App) recordStandardRequest(ctx context.Context, req StandardRequest) {
@@ -4569,7 +4756,7 @@ func (app *App) streamOpenAI(w http.ResponseWriter, r *http.Request, req Standar
 		},
 	})
 	if err != nil {
-		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": err.Error()}) + "\n\n"))
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n\n"))
 		return
 	}
 	if toolCallsSent {
@@ -4636,7 +4823,7 @@ func (app *App) streamOpenAIBuffered(w http.ResponseWriter, r *http.Request, req
 		},
 	})
 	if err != nil {
-		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": err.Error()}) + "\n\n"))
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n\n"))
 		return
 	}
 	if toolCallsSent {
@@ -5176,7 +5363,7 @@ func (app *App) streamResponses(w http.ResponseWriter, r *http.Request, req Stan
 
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", hooks)
 	if err != nil {
-		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": err.Error()})
+		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": sanitizeClientErrorString(err.Error())})
 		flushSSE(w)
 		return
 	}
@@ -5362,7 +5549,7 @@ func (app *App) streamAnthropic(w http.ResponseWriter, r *http.Request, req Stan
 
 	result, err := app.runCompletionWithHooks(r.Context(), req, "", hooks)
 	if err != nil {
-		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": err.Error()})
+		writeSSEEvent(w, "error", map[string]any{"type": "error", "error": sanitizeClientErrorString(err.Error())})
 		flushSSE(w)
 		return
 	}
@@ -5449,7 +5636,7 @@ func (app *App) handleGeminiStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	result, err := app.runCompletion(r.Context(), req, "")
 	if err != nil {
-		_, _ = w.Write([]byte(mustJSON(map[string]any{"error": err.Error()}) + "\n"))
+		_, _ = w.Write([]byte(mustJSON(map[string]any{"error": sanitizeClientErrorString(err.Error())}) + "\n"))
 		return
 	}
 	_, _ = w.Write([]byte(mustJSON(geminiPayload(result.AnswerText)) + "\n"))
@@ -6378,6 +6565,7 @@ func (app *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 		"version":                      Version,
 		"max_inflight_per_account":     app.settings.MaxInflightPerAccount,
 		"global_max_inflight":          app.accounts.Status()["global_max_inflight"],
+		"tool_recovery_max_attempts":   app.settings.ToolRecoveryMaxAttempts,
 		"max_queue_size":               app.accounts.Status()["max_queue_size"],
 		"account_ready_set_threshold":  app.settings.AccountReadySetThreshold,
 		"account_ready_set_enabled":    app.accounts.Status()["ready_set_enabled"],
@@ -6412,6 +6600,9 @@ func (app *App) adminUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := body["global_max_inflight"]; ok {
 		app.accounts.SetGlobalMaxInflight(intValue(body, "global_max_inflight", 0))
+	}
+	if _, ok := body["tool_recovery_max_attempts"]; ok {
+		app.settings.ToolRecoveryMaxAttempts = clampInt(intValue(body, "tool_recovery_max_attempts", app.settings.ToolRecoveryMaxAttempts), 1, 8)
 	}
 	if _, ok := body["chat_id_pool_target"]; ok {
 		app.settings.ChatIDPrewarmTargetPerAccount = max(0, intValue(body, "chat_id_pool_target", app.settings.ChatIDPrewarmTargetPerAccount))
@@ -6679,9 +6870,10 @@ type StandardRequest struct {
 	PreferredEmail  string
 	BoundAccount    *Account
 
-	RepeatedToolName      string
-	RepeatedToolSignature string
-	RepeatedToolCount     int
+	RepeatedToolName          string
+	RepeatedToolSignature     string
+	RepeatedToolCount         int
+	LatestMessageIsToolResult bool
 }
 
 type CompletionResult struct {
@@ -6726,22 +6918,23 @@ func buildChatStandardRequest(body map[string]any, defaultModel, surface string)
 		thinking = &v
 	}
 	return StandardRequest{
-		Prompt:                req.Prompt,
-		ResponseModel:         mode.RequestedModel,
-		ResolvedModel:         resolveModel(mode.BaseModel),
-		Surface:               req.Surface,
-		Stream:                req.Stream,
-		Tools:                 req.Tools,
-		ToolNames:             req.ToolNames,
-		ToolEnabled:           req.ToolEnabled,
-		ChatType:              mode.ChatType,
-		ThinkingEnabled:       thinking,
-		ForceThinking:         mode.ForceThinking,
-		EnableSearch:          req.EnableSearch,
-		ModelMode:             mode.Mode,
-		RepeatedToolName:      req.RepeatedToolName,
-		RepeatedToolSignature: req.RepeatedToolSignature,
-		RepeatedToolCount:     req.RepeatedToolCount,
+		Prompt:                    req.Prompt,
+		ResponseModel:             mode.RequestedModel,
+		ResolvedModel:             resolveModel(mode.BaseModel),
+		Surface:                   req.Surface,
+		Stream:                    req.Stream,
+		Tools:                     req.Tools,
+		ToolNames:                 req.ToolNames,
+		ToolEnabled:               req.ToolEnabled,
+		ChatType:                  mode.ChatType,
+		ThinkingEnabled:           thinking,
+		ForceThinking:             mode.ForceThinking,
+		EnableSearch:              req.EnableSearch,
+		ModelMode:                 mode.Mode,
+		RepeatedToolName:          req.RepeatedToolName,
+		RepeatedToolSignature:     req.RepeatedToolSignature,
+		RepeatedToolCount:         req.RepeatedToolCount,
+		LatestMessageIsToolResult: req.LatestMessageIsToolResult,
 	}
 }
 
@@ -7004,7 +7197,7 @@ func emptyCompletionFallback(req StandardRequest, result CompletionResult) strin
 }
 
 func missingToolContinuationFallback() string {
-	return "Upstream stopped after a tool result with narration only and no executable next action. Continue from the last confirmed tool result with one fresh complete QNML tool call."
+	return "Upstream could not produce a valid next client tool call after the latest tool result. The gateway retried automatically; retry the request or increase TOOL_RECOVERY_MAX_ATTEMPTS if the upstream model needs more recovery attempts."
 }
 
 func repeatedToolCallFallback(req StandardRequest, result CompletionResult) string {
@@ -7132,10 +7325,14 @@ var (
 	blockedToolNameTextRe         = regexp.MustCompile(`(?i)Tool\s+([A-Za-z0-9_.:-]+)\s+does\s+not\s+exists?\.?`)
 	roundJSONRecordRe             = regexp.MustCompile(`(?is)\{[^{}]*"round"\s*:\s*"R(\d{3,4})"[^{}]*"tool"\s*:[^{}]*\}`)
 	roundJSONRecordAltRe          = regexp.MustCompile(`(?is)\{[^{}]*"tool"\s*:[^{}]*"round"\s*:\s*"R(\d{3,4})"[^{}]*\}`)
+	explicitCompletionTurnRe      = regexp.MustCompile(`(?is)\b(?:task\s+completed?|all\s+(?:done|complete|completed)|completed\s+successfully|successfully\s+completed|verification\s+complete|checks?\s+(?:passed|complete)|tests?\s+(?:passed|complete)|completed\s+\d+\s+(?:rounds?|steps?|tasks?|items?)|\d+\s+(?:rounds?|steps?|tasks?|items?)\s+completed)\b`)
 )
 
 func shouldForceToolContinuation(req StandardRequest, result CompletionResult) bool {
 	if !req.ToolEnabled || len(req.Tools) == 0 || len(result.ToolCalls) > 0 {
+		return false
+	}
+	if !req.LatestMessageIsToolResult {
 		return false
 	}
 	if hasTextualToolMarker(toolParseText(result)) || isBlockedToolNameOutput(result, req.ToolNames) {
@@ -7161,14 +7358,14 @@ func shouldRecoverMissingInitialToolCall(req StandardRequest, result CompletionR
 	if hasTextualToolMarker(toolParseText(result)) || isBlockedToolNameOutput(result, req.ToolNames) || isRepeatedToolCallBlockedResult(result) {
 		return false
 	}
-	if promptExpectsToolContinuation(req.Prompt) || !promptRequiresClientToolAction(req.Prompt) {
+	if req.LatestMessageIsToolResult || !promptRequiresClientToolAction(req.Prompt) {
 		return false
 	}
 	text := strings.TrimSpace(toolParseText(result))
 	if text == "" {
 		return true
 	}
-	if isLikelyCompletedToolTurn(text) && !promptHasToolResult(req.Prompt) {
+	if isLikelyCompletedToolTurn(text) {
 		return true
 	}
 	return isInitialNarrationOnlyToolTurn(text)
@@ -7402,6 +7599,9 @@ func isLikelyCompletedToolTurn(text string) bool {
 		}
 	}
 	if strings.Contains(trimmed, "完成") && (strings.Contains(trimmed, "报告") || strings.Contains(trimmed, "任务") || strings.Contains(trimmed, "测试") || strings.Contains(trimmed, "最终")) {
+		return true
+	}
+	if explicitCompletionTurnRe.MatchString(trimmed) {
 		return true
 	}
 	return false
@@ -7693,6 +7893,7 @@ func NewQwenClient(pool *AccountPool, settings Settings, logger *slog.Logger) *Q
 func qwenHeaders(token string) http.Header {
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+token)
+	h.Set("x-request-id", qwenRequestID())
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	h.Set("Accept", "application/json, text/plain, */*")
 	h.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -7706,6 +7907,20 @@ func qwenHeaders(token string) http.Header {
 	h.Set("sec-fetch-mode", "cors")
 	h.Set("sec-fetch-site", "same-origin")
 	return h
+}
+
+func qwenRequestID() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		id := randomID()
+		if len(id) >= 32 {
+			return fmt.Sprintf("%s-%s-%s-%s-%s", id[:8], id[8:12], id[12:16], id[16:20], id[20:32])
+		}
+		return id
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string, body any, timeout time.Duration) (int, string, error) {
@@ -7730,16 +7945,17 @@ func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	upstreamRequestID := req.Header.Get("x-request-id")
 	start := time.Now()
-	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token))
+	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(token), "duration_ms", time.Since(start).Milliseconds(), "error", err)
+		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
 		return 0, err.Error(), err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	attrs := []any{"method", method, "path", path, "token", redactToken(token), "status", resp.StatusCode, "bytes", len(raw), "duration_ms", time.Since(start).Milliseconds()}
+	attrs := []any{"method", method, "path", path, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "bytes", len(raw), "duration_ms", time.Since(start).Milliseconds()}
 	if resp.StatusCode >= 400 {
 		attrs = append(attrs, "body", truncate(string(raw), 240))
 		logWarn(c.logger, ctx, "上游请求完成", attrs...)
@@ -7823,22 +8039,23 @@ func (c *QwenClient) StreamChat(ctx context.Context, token, chatID string, paylo
 	req.Header = qwenHeaders(token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(token), "payload_bytes", len(raw))
+	upstreamRequestID := req.Header.Get("x-request-id")
+	logInfo(c.logger, ctx, "开始上游流式请求", "chat_id", chatID, "token", redactToken(token), "upstream_request_id", upstreamRequestID, "payload_bytes", len(raw))
 	start := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		logWarn(c.logger, ctx, "上游流式请求失败", "chat_id", chatID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
+		logWarn(c.logger, ctx, "上游流式请求失败", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "duration_ms", time.Since(start).Milliseconds(), "error", err)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		logWarn(c.logger, ctx, "上游流式返回错误", "chat_id", chatID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
+		logWarn(c.logger, ctx, "上游流式返回错误", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "duration_ms", time.Since(start).Milliseconds(), "body", truncate(string(body), 240))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 800))
 	}
 	firstEventTimeout := streamTimeoutDuration(c.settings.UpstreamStreamFirstEventTimeoutSeconds)
 	idleTimeout := streamTimeoutDuration(c.settings.UpstreamStreamIdleTimeoutSeconds)
-	logInfo(c.logger, ctx, "上游流式连接建立", "chat_id", chatID, "status", resp.StatusCode, "first_event_timeout_seconds", int(firstEventTimeout/time.Second), "idle_timeout_seconds", int(idleTimeout/time.Second))
+	logInfo(c.logger, ctx, "上游流式连接建立", "chat_id", chatID, "upstream_request_id", upstreamRequestID, "status", resp.StatusCode, "first_event_timeout_seconds", int(firstEventTimeout/time.Second), "idle_timeout_seconds", int(idleTimeout/time.Second))
 	reader := bufio.NewReader(resp.Body)
 	lineReads := make(chan streamLineRead, 1)
 	go func() {
@@ -8689,7 +8906,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, status int, detail any) {
-	writeJSON(w, status, map[string]any{"detail": detail})
+	writeJSON(w, status, map[string]any{"detail": sanitizeClientErrorDetail(detail)})
 }
 
 func decodeJSON(r *http.Request, dst any) error {

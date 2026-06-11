@@ -48,9 +48,10 @@ type StandardRequest struct {
 	EnableSearch    bool
 	ModelMode       string
 
-	RepeatedToolName      string
-	RepeatedToolSignature string
-	RepeatedToolCount     int
+	RepeatedToolName          string
+	RepeatedToolSignature     string
+	RepeatedToolCount         int
+	LatestMessageIsToolResult bool
 }
 
 type ModelMode struct {
@@ -97,6 +98,7 @@ func BuildChatStandardRequest(body map[string]any, defaultModel, surface string,
 		ToolEnabled: toolEnabled, ChatType: mode.ChatType, ThinkingEnabled: thinking,
 		ForceThinking: mode.ForceThinking, EnableSearch: enableSearch, ModelMode: mode.Mode,
 		RepeatedToolName: repeated.Name, RepeatedToolSignature: repeated.Signature, RepeatedToolCount: repeatedCount,
+		LatestMessageIsToolResult: latestMessageIsToolResult(messages),
 	}
 }
 
@@ -188,7 +190,7 @@ func messagesToToolPrompt(messages []any, tools []map[string]any) string {
 	if droppedNotice != "" {
 		parts = append(parts, droppedNotice)
 	}
-	if fewShot := buildFewShotBlock(sortToolsForPrompt(tools, detectToolProfile(tools))); fewShot != "" {
+	if fewShot := buildFewShotBlock(qwenSafePromptTools(sortToolsForPrompt(tools, detectToolProfile(tools)))); fewShot != "" {
 		parts = append(parts, fewShot)
 	}
 	history := renderToolHistory(trimmedMessages, maxHistoryMessages)
@@ -734,7 +736,7 @@ type toolCallActivity struct {
 
 func buildRepeatedToolCallNotice(messages []any) string {
 	call, count := latestRepeatedToolCallActivity(messages, 10)
-	name := call.Name
+	name := qwenSafeToolName(call.Name)
 	if name == "" || count < 2 {
 		return ""
 	}
@@ -884,7 +886,7 @@ func messageToolCallSummaries(msg map[string]any) []string {
 		}
 		name, args := toolCallNameAndArgs(call)
 		if name != "" {
-			summary := name
+			summary := qwenSafeToolName(name)
 			if args != "" {
 				summary += " " + clipText(args, 160)
 			}
@@ -903,7 +905,7 @@ func messageToolCallSummaries(msg map[string]any) []string {
 			args = string(raw)
 		}
 		if name != "" {
-			summary := name
+			summary := qwenSafeToolName(name)
 			if args != "" {
 				summary += " " + clipText(args, 160)
 			}
@@ -1005,6 +1007,8 @@ func shouldSkipAssistantHistoryText(text string) bool {
 		return true
 	}
 	for _, prefix := range []string{
+		"upstream stopped after a tool result with narration only",
+		"upstream could not produce a valid next client tool call",
 		"upstream produced invalid tool-availability text",
 		"no recoverable assistant content was produced",
 	} {
@@ -1098,6 +1102,25 @@ func messageContainsToolResult(msg map[string]any) bool {
 	return false
 }
 
+func latestMessageIsToolResult(messages []any) bool {
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		msg, ok := messages[idx].(map[string]any)
+		if !ok {
+			continue
+		}
+		role := stringValue(msg, "role", "")
+		if role == "tool" || messageContainsToolResult(msg) {
+			return true
+		}
+		if role == "user" || role == "assistant" || role == "system" || role == "developer" {
+			if strings.TrimSpace(ExtractContentText(msg["content"])) != "" || len(anyList(msg["tool_calls"])) > 0 {
+				return false
+			}
+		}
+	}
+	return false
+}
+
 func ExtractContentText(content any) string {
 	switch v := content.(type) {
 	case nil:
@@ -1125,7 +1148,7 @@ func ExtractContentText(content any) string {
 					parts = append(parts, text)
 				}
 			case "tool_use":
-				if rendered := renderQNMLToolCall(stringValue(m, "name", ""), mapValue(m["input"])); rendered != "" {
+				if rendered := renderQNMLToolCall(qwenSafeToolName(stringValue(m, "name", "")), mapValue(m["input"])); rendered != "" {
 					parts = append(parts, rendered)
 				}
 			case "tool_result", "function_call_output":
@@ -1164,7 +1187,8 @@ func BuildToolInstructions(tools []map[string]any) string {
 	prefix := buildCommonToolInstructionPrefix(profile)
 	names := []string{}
 	schemas := []string{}
-	sortedTools := sortToolsForPrompt(tools, profile)
+	originalTools := sortToolsForPrompt(tools, profile)
+	sortedTools := qwenSafePromptTools(originalTools)
 	for _, tool := range sortedTools {
 		name := stringValue(tool, "name", "")
 		if name == "" {
@@ -1178,12 +1202,106 @@ func BuildToolInstructions(tools []map[string]any) string {
 		schemas = append(schemas, fmt.Sprintf(
 			"Action name: %s\nDescription: %s\nParameters: %s",
 			name,
-			trim(stringValue(tool, "description", ""), 120),
+			obfuscateBareToolNames(trim(stringValue(tool, "description", ""), 120), originalTools),
 			summarizeToolParameters(params),
 		))
 	}
-	blocks := []string{strings.Join(prefix, "\n"), buildProfileToolBlock(profile, sortedTools), buildQNMLToolInstructions(sortedTools, names, schemas)}
+	blocks := []string{
+		obfuscateBareToolNames(strings.Join(prefix, "\n"), originalTools),
+		obfuscateBareToolNames(buildProfileToolBlock(profile, sortedTools), originalTools),
+		buildQNMLToolInstructions(sortedTools, names, schemas),
+	}
 	return strings.Join(blocks, "\n\n")
+}
+
+func qwenSafePromptTools(tools []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		name := stringValue(tool, "name", "")
+		if name == "" {
+			continue
+		}
+		clone := map[string]any{}
+		for key, value := range tool {
+			clone[key] = value
+		}
+		clone["name"] = qwenSafeToolName(name)
+		out = append(out, clone)
+	}
+	return out
+}
+
+func qwenSafeToolName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	switch name {
+	case "Read":
+		return "fs_open_file"
+	case "Write":
+		return "fs_put_file"
+	case "Edit":
+		return "fs_patch_file"
+	case "Bash":
+		return "shell_run"
+	case "Grep":
+		return "text_search"
+	case "Glob":
+		return "path_find"
+	case "NotebookEdit":
+		return "notebook_patch"
+	case "WebFetch":
+		return "http_get_url"
+	case "WebSearch":
+		return "web_query"
+	}
+	if qwenSafeAliasIsCanonical(name) || strings.HasPrefix(name, "u_") {
+		return name
+	}
+	return "u_" + name
+}
+
+func qwenSafeAliasIsCanonical(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "fs_open_file", "fs_put_file", "fs_patch_file", "shell_run", "text_search", "path_find", "notebook_patch", "http_get_url", "web_query":
+		return true
+	default:
+		return false
+	}
+}
+
+func obfuscateBareToolNames(text string, tools []map[string]any) string {
+	if text == "" || len(tools) == 0 {
+		return text
+	}
+	type replacement struct {
+		raw  string
+		safe string
+	}
+	replacements := []replacement{}
+	seen := map[string]bool{}
+	for _, tool := range tools {
+		raw := stringValue(tool, "name", "")
+		if raw == "" || seen[raw] {
+			continue
+		}
+		safe := qwenSafeToolName(raw)
+		if safe == "" || safe == raw {
+			continue
+		}
+		seen[raw] = true
+		replacements = append(replacements, replacement{raw: raw, safe: safe})
+	}
+	sort.SliceStable(replacements, func(i, j int) bool {
+		return len(replacements[i].raw) > len(replacements[j].raw)
+	})
+	out := text
+	for _, item := range replacements {
+		re := regexp.MustCompile(`\b` + regexp.QuoteMeta(item.raw) + `\b`)
+		out = re.ReplaceAllString(out, item.safe)
+	}
+	return out
 }
 
 func buildQNMLToolInstructions(tools []map[string]any, names []string, schemas []string) string {
@@ -1215,14 +1333,14 @@ FORMAT:
 </|QNML|tool_calls>
 
 RULES:
-1) If calling tools, output only one <|QNML|tool_calls> block; no markdown fences or extra prose.
+1) If calling tools, provide a parseable <|QNML|tool_calls> block. If no tool is needed, answer normally.
 2) Put one or more <|QNML|invoke> nodes under the wrapper. Use exact tool and parameter names from the schema.
 3) Strings use <![CDATA[...]]>; objects use nested XML elements; arrays repeat <item>; numbers/bools/null stay plain text.
 4) Never emit empty required parameters, especially shell commands. If required info is unknown, ask normally.
 5) After [Tool Result], continue with more QNML calls only if needed; otherwise answer normally.
 6) Prefer direct project tools. Use Agent/task/scheduling/control tools only when clearly necessary or explicitly requested.
-7) Bash/shell tools run in the client tool environment. Prefer workspace-relative paths and avoid unverified raw Windows paths in shell commands.
-8) Never write availability-error prose for any name in Available action names. Use the QNML format exactly.
+7) Shell-capable actions run in the client tool environment. Prefer workspace-relative paths and avoid unverified raw Windows paths in shell commands.
+8) Do not claim an Available action name is unavailable; use QNML when you choose to call that action.
 9) Path parameters such as path/file_path/filename must contain only the path string, with no prose, round labels, status text, or QNML/XML fragments.
 
 CORRECT EXAMPLES:
@@ -1410,7 +1528,10 @@ func pickFewShotTools(tools []map[string]any, maxThirdParty int) []map[string]an
 		}
 	}
 	selected := []map[string]any{}
-	for _, wants := range [][]string{{"read", "readfile"}, {"bash", "terminal", "powershell", "shell", "executecommand", "runcommand"}} {
+	for _, wants := range [][]string{
+		{"read", "readfile", "fs_open_file"},
+		{"bash", "terminal", "powershell", "shell", "shell_run", "executecommand", "runcommand"},
+	} {
 		for _, tool := range safe {
 			name := stringValue(tool, "name", "")
 			if normalizedNameIn(name, wants) {
@@ -1456,11 +1577,16 @@ func pickFewShotTools(tools []map[string]any, maxThirdParty int) []map[string]an
 }
 
 func isCoreToolName(name string) bool {
+	name = strings.TrimSpace(name)
+	if strings.HasPrefix(name, "u_") && len(name) > 2 {
+		name = strings.TrimPrefix(name, "u_")
+	}
 	key := regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(strings.ToLower(name), "")
 	switch key {
 	case "read", "readfile", "readfiletool", "write", "writefile", "bash", "executecommand",
 		"runcommand", "terminal", "powershell", "shell", "listdir", "listdirectory", "grep", "glob",
-		"search", "searchfiles", "edit", "editfile":
+		"search", "searchfiles", "edit", "editfile", "fsopenfile", "fsputfile", "fspatchfile",
+		"shellrun", "textsearch", "pathfind", "httpgeturl", "webquery":
 		return true
 	default:
 		return false
@@ -1468,9 +1594,18 @@ func isCoreToolName(name string) bool {
 }
 
 func normalizedNameIn(name string, wants []string) bool {
+	name = strings.TrimSpace(name)
+	if strings.HasPrefix(name, "u_") && len(name) > 2 {
+		name = strings.TrimPrefix(name, "u_")
+	}
 	key := regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(strings.ToLower(name), "")
+	nameCap := classifyToolCapability(name)
 	for _, want := range wants {
-		if key == regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(strings.ToLower(want), "") {
+		wantKey := regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(strings.ToLower(want), "")
+		if key == wantKey {
+			return true
+		}
+		if nameCap != "" && nameCap == classifyToolCapability(want) {
 			return true
 		}
 	}
@@ -1520,17 +1655,17 @@ func exampleToolParams(tool map[string]any) map[string]any {
 		return fromSchema
 	}
 	switch key {
-	case "read", "readfile":
+	case "read", "readfile", "fsopenfile":
 		return map[string]any{"file_path": "src/index.ts"}
-	case "write", "writefile":
+	case "write", "writefile", "fsputfile":
 		return map[string]any{"file_path": "output.txt", "content": "..."}
-	case "bash", "executecommand", "runcommand", "terminal", "powershell", "shell":
+	case "bash", "executecommand", "runcommand", "terminal", "powershell", "shell", "shellrun":
 		return map[string]any{"command": "ls -la"}
-	case "glob":
+	case "glob", "pathfind":
 		return map[string]any{"pattern": "**/*.go"}
-	case "grep", "search", "searchfiles":
+	case "grep", "search", "searchfiles", "textsearch":
 		return map[string]any{"pattern": "TODO"}
-	case "edit", "editfile":
+	case "edit", "editfile", "fspatchfile":
 		return map[string]any{"file_path": "src/main.ts", "old_string": "old", "new_string": "new"}
 	}
 	params := firstNonNil(tool["parameters"], tool["input_schema"])
@@ -1638,7 +1773,7 @@ func renderAssistantToolCalls(raw any) string {
 			_ = json.Unmarshal([]byte(rawArgs), &args)
 		}
 		if name != "" {
-			calls = append(calls, renderQNMLToolCall(name, args))
+			calls = append(calls, renderQNMLToolCall(qwenSafeToolName(name), args))
 		}
 	}
 	return strings.Join(calls, "\n\n")

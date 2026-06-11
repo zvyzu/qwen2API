@@ -37,32 +37,32 @@ var commonToolCapabilities = []toolCapability{
 	{
 		Key:     "read",
 		Label:   "file read",
-		Aliases: []string{"read", "readfile", "readfiletool", "read_file", "openfile", "open_file", "fsopenfile", "viewfile"},
+		Aliases: []string{"read", "readfile", "readfiletool", "read_file", "openfile", "open_file", "fsopenfile", "fs_open_file", "viewfile"},
 	},
 	{
 		Key:     "write",
 		Label:   "file write",
-		Aliases: []string{"write", "writefile", "write_file", "createfile", "create_file", "savefile"},
+		Aliases: []string{"write", "writefile", "write_file", "createfile", "create_file", "savefile", "fsputfile", "fs_put_file"},
 	},
 	{
 		Key:     "edit",
 		Label:   "file edit/patch",
-		Aliases: []string{"edit", "editfile", "edit_file", "multiedit", "multi_edit", "notebookedit", "notebook_edit", "patch", "applypatch", "apply_patch"},
+		Aliases: []string{"edit", "editfile", "edit_file", "multiedit", "multi_edit", "notebookedit", "notebook_edit", "notebookpatch", "notebook_patch", "patch", "applypatch", "apply_patch", "fspatchfile", "fs_patch_file"},
 	},
 	{
 		Key:     "shell",
 		Label:   "shell/terminal",
-		Aliases: []string{"bash", "terminal", "powershell", "shell", "shellrun", "exec", "execute", "executecommand", "execute_code", "runcommand", "run_command"},
+		Aliases: []string{"bash", "terminal", "powershell", "shell", "shellrun", "shell_run", "exec", "execute", "executecommand", "execute_code", "runcommand", "run_command"},
 	},
 	{
 		Key:     "search",
 		Label:   "file search/list",
-		Aliases: []string{"glob", "grep", "search", "searchfiles", "search_files", "find", "findfiles", "ls", "listdir", "listdirectory", "listfiles", "list_files"},
+		Aliases: []string{"glob", "grep", "search", "searchfiles", "search_files", "find", "findfiles", "pathfind", "path_find", "textsearch", "text_search", "ls", "listdir", "listdirectory", "listfiles", "list_files"},
 	},
 	{
 		Key:     "web",
 		Label:   "web fetch/search",
-		Aliases: []string{"webfetch", "web_fetch", "websearch", "web_search", "fetch", "browser"},
+		Aliases: []string{"webfetch", "web_fetch", "websearch", "web_search", "httpgeturl", "http_get_url", "webquery", "web_query", "fetch", "browser"},
 	},
 	{
 		Key:     "skills",
@@ -132,6 +132,14 @@ func toolNamesFromTools(tools []map[string]any) toolNameSet {
 
 func normalizeProfileToolName(name string) string {
 	return toolProfileNameRe.ReplaceAllString(strings.ToLower(strings.TrimSpace(name)), "")
+}
+
+func normalizeProfileToolLookupName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if strings.HasPrefix(trimmed, "u_") && len(trimmed) > 2 {
+		trimmed = strings.TrimPrefix(trimmed, "u_")
+	}
+	return normalizeProfileToolName(trimmed)
 }
 
 func (names toolNameSet) hasAny(candidates ...string) bool {
@@ -224,7 +232,7 @@ func buildCapabilityMap(tools []map[string]any) string {
 }
 
 func classifyToolCapability(name string) string {
-	key := normalizeProfileToolName(name)
+	key := normalizeProfileToolLookupName(name)
 	for _, capability := range commonToolCapabilities {
 		for _, alias := range capability.Aliases {
 			if key == normalizeProfileToolName(alias) {
@@ -249,7 +257,7 @@ func sortToolsForPrompt(tools []map[string]any, profile cliToolProfile) []map[st
 }
 
 func toolPromptPriorityForProfile(profile cliToolProfile, toolName string) (int, string) {
-	key := normalizeProfileToolName(toolName)
+	key := normalizeProfileToolLookupName(toolName)
 	if profile.Priority != nil {
 		if priority, ok := profile.Priority[key]; ok {
 			return priority, toolName
